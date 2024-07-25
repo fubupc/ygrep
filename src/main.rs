@@ -23,14 +23,61 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let pattern = regex::Regex::new(&cli.pattern)?;
-    let stdout = io::stdout();
+    let mut stdout = io::stdout();
 
     for path in cli.paths {
-        for file in FileIter::read(path)? {
-            let file = fs::File::open(file?)?;
-            search(file, &stdout, &pattern)?;
+        // TODO: Duplicated error handling as in search_path(), find a better way.
+        if let Err(err) = search_path(&path, &mut stdout, &pattern) {
+            eprintln!("ERROR: {}: {}", &path, err);
+        };
+    }
+
+    Ok(())
+}
+
+fn search_path<P: AsRef<path::Path>, W: io::Write>(
+    path: P,
+    mut writer: W,
+    pattern: &regex::Regex,
+) -> anyhow::Result<()> {
+    let iter = FileIter::read(path)?;
+
+    for file in iter {
+        // TODO: Early return because this must be fs::ReadDir error?
+        let file = file?;
+        if let Err(err) = search_file(&file, &mut writer, pattern) {
+            eprintln!("ERROR: {}: {}", file.to_str().unwrap(), err);
+        };
+    }
+
+    Ok(())
+}
+
+fn search_file<P: AsRef<path::Path>, W: io::Write>(
+    file: P,
+    mut writer: W,
+    pattern: &regex::Regex,
+) -> anyhow::Result<()> {
+    let file = fs::File::open(file)?;
+    search(file, &mut writer, &pattern)
+}
+
+fn search<R: io::Read, W: io::Write>(
+    reader: R,
+    mut writer: W,
+    pattern: &regex::Regex,
+) -> anyhow::Result<()> {
+    let reader = io::BufReader::new(reader);
+
+    for line in reader.lines() {
+        let line = line?;
+        if pattern.is_match(&line) {
+            writer.write_all(line.as_bytes())?;
+            writer.write(b"\n")?;
         }
     }
+
+    writer.flush()?;
 
     Ok(())
 }
@@ -97,24 +144,4 @@ impl Iterator for FileIter {
             }
         }
     }
-}
-
-fn search<R: io::Read, W: io::Write>(
-    reader: R,
-    mut writer: W,
-    pattern: &regex::Regex,
-) -> anyhow::Result<()> {
-    let reader = io::BufReader::new(reader);
-
-    for line in reader.lines() {
-        let line = line?;
-        if pattern.is_match(&line) {
-            writer.write_all(line.as_bytes())?;
-            writer.write(b"\n")?;
-        }
-    }
-
-    writer.flush()?;
-
-    Ok(())
 }
