@@ -4,6 +4,7 @@ use std::{
     path,
 };
 
+use anyhow::Context;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -23,43 +24,55 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let pattern = regex::Regex::new(&cli.pattern)?;
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
 
     for path in cli.paths {
-        // TODO: Duplicated error handling as in search_path(), find a better way.
-        if let Err(err) = search_path(&path, &mut stdout, &pattern) {
-            eprintln!("ERROR: {}: {}", &path, err);
-        };
+        if let Err(err) = search_in_path(&path, &stdout, &pattern) {
+            eprintln!("ygrep: {}: {}", &path, err);
+        }
     }
 
     Ok(())
 }
 
-fn search_path<P: AsRef<path::Path>, W: io::Write>(
+fn search_in_path<P: AsRef<path::Path>, W: io::Write>(
+    path: P,
+    writer: W,
+    pattern: &regex::Regex,
+) -> anyhow::Result<()> {
+    let ty = fs::metadata(&path)?.file_type();
+    if ty.is_file() {
+        return search_in_file(&path, writer, &pattern);
+    }
+
+    if ty.is_dir() {
+        return search_in_dir(path, writer, pattern);
+    }
+
+    Ok(())
+}
+
+fn search_in_file<P: AsRef<path::Path>, W: io::Write>(
+    path: P,
+    writer: W,
+    pattern: &regex::Regex,
+) -> anyhow::Result<()> {
+    let file = fs::File::open(&path)?;
+    search(&file, writer, &pattern)
+}
+
+fn search_in_dir<P: AsRef<path::Path>, W: io::Write>(
     path: P,
     mut writer: W,
     pattern: &regex::Regex,
 ) -> anyhow::Result<()> {
-    let iter = FileIter::read(path)?;
-
-    for file in iter {
-        // TODO: Early return because this must be fs::ReadDir error?
+    for file in FileIter::read_dir(&path)? {
         let file = file?;
-        if let Err(err) = search_file(&file, &mut writer, pattern) {
-            eprintln!("ERROR: {}: {}", file.to_str().unwrap(), err);
+        if let Err(err) = search_in_file(&file, &mut writer, &pattern) {
+            eprintln!("ygrep: {}: {}", file.display(), err);
         };
     }
-
     Ok(())
-}
-
-fn search_file<P: AsRef<path::Path>, W: io::Write>(
-    file: P,
-    mut writer: W,
-    pattern: &regex::Regex,
-) -> anyhow::Result<()> {
-    let file = fs::File::open(file)?;
-    search(file, &mut writer, &pattern)
 }
 
 fn search<R: io::Read, W: io::Write>(
@@ -82,66 +95,79 @@ fn search<R: io::Read, W: io::Write>(
     Ok(())
 }
 
-enum FileIter {
-    File(path::PathBuf),
-    Dir {
-        iter: fs::ReadDir,
-        child_iter: Option<Box<FileIter>>,
-    },
-    Done,
+struct FileIter {
+    dir: path::PathBuf,
+    inner: fs::ReadDir,
+    child_iter: Option<Box<FileIter>>,
 }
 
 impl FileIter {
-    fn read<P: AsRef<path::Path>>(path: P) -> io::Result<FileIter> {
-        let meta = fs::metadata(&path)?;
-
-        if meta.is_dir() {
-            Ok(FileIter::Dir {
-                iter: fs::read_dir(&path)?,
-                child_iter: None,
-            })
-        } else {
-            Ok(FileIter::File(path.as_ref().to_path_buf()))
-        }
+    fn read_dir<P: AsRef<path::Path>>(dir: P) -> io::Result<FileIter> {
+        Ok(FileIter {
+            dir: dir.as_ref().to_path_buf(),
+            inner: fs::read_dir(&dir)?,
+            child_iter: None,
+        })
     }
 }
 
 impl Iterator for FileIter {
-    type Item = io::Result<path::PathBuf>;
+    type Item = anyhow::Result<path::PathBuf>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            FileIter::Done => None,
-            FileIter::File(path) => {
-                let path = path.clone();
-                *self = FileIter::Done; // Iteration end.
-                Some(Ok(path))
+        // helper transpose Option<Result<T, E>> to Result<Option<T>, E>
+        fn helper(me: &mut FileIter) -> anyhow::Result<Option<path::PathBuf>> {
+            if let Some(child_iter) = &mut me.child_iter {
+                if let Some(item) = child_iter.next() {
+                    return Ok(Some(item?));
+                }
+                me.child_iter = None; // Clear when child iteration finish.
             }
-            FileIter::Dir { iter, child_iter } => {
-                if let Some(child_iter_inner) = child_iter {
-                    match child_iter_inner.next() {
-                        Some(item) => return Some(item),
-                        None => *child_iter = None,
-                    }
+
+            while let Some(next) = me.inner.next() {
+                let next = next
+                    .with_context(|| {
+                        format!("Error reading dir entries of `{}`", me.dir.display())
+                    })?
+                    .path();
+
+                let ty = fs::metadata(&next)
+                    .with_context(|| format!("Error reading metadata of `{}`", next.display()))?
+                    .file_type();
+
+                if ty.is_file() {
+                    return Ok(Some(next));
                 }
 
-                let Some(next) = iter.next() else {
-                    *self = FileIter::Done; // Iteration end.
-                    return None;
-                };
+                if ty.is_dir() {
+                    let mut child_iter = FileIter::read_dir(&next).with_context(|| {
+                        format!("Error reading dir entries of `{}`", next.display())
+                    })?;
+                    let child_next = match child_iter.next() {
+                        Some(child_next) => child_next?,
+                        None => continue,
+                    };
+                    me.child_iter = Some(Box::new(child_iter)); // Store remaining child iter
+                    return Ok(Some(child_next));
+                }
 
-                let next = match next {
-                    Ok(next) => next,
-                    Err(err) => return Some(Err(err)),
-                };
+                if ty.is_symlink() {
+                    panic!("impossible: fs::metadata(path).file_type() cannot be symlink")
+                }
 
-                match FileIter::read(next.path()) {
-                    Ok(iter) => *child_iter = Some(Box::new(iter)),
-                    Err(err) => return Some(Err(err)),
-                };
-
-                self.next()
+                // Ignore other file types e.g. block device, char device, fifo etc.
             }
+
+            // If both self.inner and self.child_iter are empty then iteration has been done.
+            Ok(None)
+        }
+
+        match helper(self) {
+            Ok(next) => match next {
+                Some(next) => Some(Ok(next)),
+                None => None,
+            },
+            Err(err) => Some(Err(err)),
         }
     }
 }
