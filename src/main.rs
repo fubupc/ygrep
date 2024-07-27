@@ -4,7 +4,6 @@ use std::{
     path,
 };
 
-use anyhow::Context;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -24,150 +23,106 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let pattern = regex::Regex::new(&cli.pattern)?;
-    let stdout = io::stdout();
+    let mut searcher = Searcher {
+        pattern,
+        writer: io::stdout(),
+    };
 
     for path in cli.paths {
-        if let Err(err) = search_in_path(&path, &stdout, &pattern) {
-            eprintln!("ygrep: {}: {}", &path, err);
+        walk_path(&path, &mut searcher, false);
+    }
+
+    Ok(())
+}
+
+struct Searcher<W: io::Write> {
+    pattern: regex::Regex,
+    writer: W,
+}
+
+impl<W: io::Write> Searcher<W> {
+    fn search<R: io::Read>(&mut self, reader: R) -> anyhow::Result<()> {
+        let reader = io::BufReader::new(reader);
+
+        for line in reader.lines() {
+            let line = line?;
+            if self.pattern.is_match(&line) {
+                self.writer.write_all(line.as_bytes())?;
+                self.writer.write(b"\n")?;
+                self.writer.flush()?;
+            }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
-fn search_in_path<P: AsRef<path::Path>, W: io::Write>(
-    path: P,
-    writer: W,
-    pattern: &regex::Regex,
-) -> anyhow::Result<()> {
-    let ty = fs::metadata(&path)?.file_type();
-    if ty.is_file() {
-        return search_in_file(&path, writer, &pattern);
+impl<W: io::Write> Visitor for Searcher<W> {
+    fn visit_file<P: AsRef<path::Path>>(&mut self, path: P) -> anyhow::Result<()> {
+        let file = fs::File::open(&path)?;
+        self.search(&file)
     }
 
-    if ty.is_dir() {
-        return search_in_dir(path, writer, pattern);
+    fn on_error(&self, path: &path::Path, err: anyhow::Error) {
+        eprintln!("ygrep: {}: {}", path.display(), err);
     }
-
-    Ok(())
 }
 
-fn search_in_file<P: AsRef<path::Path>, W: io::Write>(
-    path: P,
-    writer: W,
-    pattern: &regex::Regex,
-) -> anyhow::Result<()> {
-    let file = fs::File::open(&path)?;
-    search(&file, writer, &pattern)
+trait Visitor {
+    fn visit_file<P: AsRef<path::Path>>(&mut self, path: P) -> anyhow::Result<()>;
+    fn on_error(&self, path: &path::Path, err: anyhow::Error);
 }
 
-fn search_in_dir<P: AsRef<path::Path>, W: io::Write>(
-    path: P,
-    mut writer: W,
-    pattern: &regex::Regex,
-) -> anyhow::Result<()> {
-    for file in FileIter::read_dir(&path)? {
-        let file = file?;
-        if let Err(err) = search_in_file(&file, &mut writer, &pattern) {
-            eprintln!("ygrep: {}: {}", file.display(), err);
+fn walk_path<P, V>(path: P, visitor: &mut V, follow_symlink: bool)
+where
+    P: AsRef<path::Path>,
+    V: Visitor,
+{
+    fn walk_path_inner<V>(path: &path::Path, visitor: &mut V, follow_symlink: bool)
+    where
+        V: Visitor,
+    {
+        let meta = if follow_symlink {
+            fs::metadata(path)
+        } else {
+            fs::symlink_metadata(path)
         };
-    }
-    Ok(())
-}
-
-fn search<R: io::Read, W: io::Write>(
-    reader: R,
-    mut writer: W,
-    pattern: &regex::Regex,
-) -> anyhow::Result<()> {
-    let reader = io::BufReader::new(reader);
-
-    for line in reader.lines() {
-        let line = line?;
-        if pattern.is_match(&line) {
-            writer.write_all(line.as_bytes())?;
-            writer.write(b"\n")?;
-        }
-    }
-
-    writer.flush()?;
-
-    Ok(())
-}
-
-struct FileIter {
-    dir: path::PathBuf,
-    inner: fs::ReadDir,
-    child_iter: Option<Box<FileIter>>,
-}
-
-impl FileIter {
-    fn read_dir<P: AsRef<path::Path>>(dir: P) -> io::Result<FileIter> {
-        Ok(FileIter {
-            dir: dir.as_ref().to_path_buf(),
-            inner: fs::read_dir(&dir)?,
-            child_iter: None,
-        })
-    }
-}
-
-impl Iterator for FileIter {
-    type Item = anyhow::Result<path::PathBuf>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // helper transpose Option<Result<T, E>> to Result<Option<T>, E>
-        fn helper(me: &mut FileIter) -> anyhow::Result<Option<path::PathBuf>> {
-            if let Some(child_iter) = &mut me.child_iter {
-                if let Some(item) = child_iter.next() {
-                    return Ok(Some(item?));
-                }
-                me.child_iter = None; // Clear when child iteration finish.
+        let meta = match meta {
+            Ok(meta) => meta,
+            Err(err) => {
+                visitor.on_error(path, err.into());
+                return;
             }
+        };
 
-            while let Some(next) = me.inner.next() {
-                let next = next
-                    .with_context(|| {
-                        format!("Error reading dir entries of `{}`", me.dir.display())
-                    })?
-                    .path();
-
-                let ty = fs::metadata(&next)
-                    .with_context(|| format!("Error reading metadata of `{}`", next.display()))?
-                    .file_type();
-
-                if ty.is_file() {
-                    return Ok(Some(next));
-                }
-
-                if ty.is_dir() {
-                    let mut child_iter = FileIter::read_dir(&next).with_context(|| {
-                        format!("Error reading dir entries of `{}`", next.display())
-                    })?;
-                    let child_next = match child_iter.next() {
-                        Some(child_next) => child_next?,
-                        None => continue,
-                    };
-                    me.child_iter = Some(Box::new(child_iter)); // Store remaining child iter
-                    return Ok(Some(child_next));
-                }
-
-                if ty.is_symlink() {
-                    panic!("impossible: fs::metadata(path).file_type() cannot be symlink")
-                }
-
-                // Ignore other file types e.g. block device, char device, fifo etc.
-            }
-
-            // If both self.inner and self.child_iter are empty then iteration has been done.
-            Ok(None)
+        let ty = meta.file_type();
+        if ty.is_file() {
+            if let Err(err) = visitor.visit_file(&path) {
+                visitor.on_error(path, err.into());
+            };
+            return;
         }
 
-        match helper(self) {
-            Ok(next) => match next {
-                Some(next) => Some(Ok(next)),
-                None => None,
-            },
-            Err(err) => Some(Err(err)),
+        if ty.is_dir() {
+            let entries = match fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    visitor.on_error(path, err.into());
+                    return;
+                }
+            };
+            for e in entries {
+                let e = match e {
+                    Ok(e) => e,
+                    Err(err) => {
+                        visitor.on_error(path, err.into());
+                        return;
+                    }
+                };
+                walk_path_inner(&e.path(), visitor, follow_symlink);
+            }
         }
     }
+
+    walk_path_inner(path.as_ref(), visitor, follow_symlink)
 }
