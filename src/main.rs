@@ -4,6 +4,7 @@ use std::{
     path,
 };
 
+use anyhow::Ok;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -78,7 +79,12 @@ where
     P: AsRef<path::Path>,
     V: Visitor,
 {
-    fn walk_path_inner<V>(path: &path::Path, visitor: &mut V, follow_symlink: bool)
+    // An helper that returns `Result` so `?` can be used internally.
+    fn throw_error<V>(
+        path: &path::Path,
+        visitor: &mut V,
+        follow_symlink: bool,
+    ) -> anyhow::Result<()>
     where
         V: Visitor,
     {
@@ -87,42 +93,32 @@ where
         } else {
             fs::symlink_metadata(path)
         };
-        let meta = match meta {
-            Ok(meta) => meta,
-            Err(err) => {
-                visitor.on_error(path, err.into());
-                return;
-            }
-        };
 
-        let ty = meta.file_type();
+        let ty = meta?.file_type();
         if ty.is_file() {
-            if let Err(err) = visitor.visit_file(&path) {
-                visitor.on_error(path, err.into());
-            };
-            return;
+            return visitor.visit_file(&path);
         }
 
         if ty.is_dir() {
-            let entries = match fs::read_dir(&path) {
-                Ok(entries) => entries,
-                Err(err) => {
-                    visitor.on_error(path, err.into());
-                    return;
-                }
-            };
-            for e in entries {
-                let e = match e {
-                    Ok(e) => e,
-                    Err(err) => {
-                        visitor.on_error(path, err.into());
-                        return;
-                    }
-                };
-                walk_path_inner(&e.path(), visitor, follow_symlink);
+            for e in fs::read_dir(&path)? {
+                let e = e?;
+                catch_error(&e.path(), visitor, follow_symlink);
             }
+            return Ok(());
+        }
+
+        // Ignore other file types like: block device, char device, etc.
+        Ok(())
+    }
+
+    fn catch_error<V>(path: &path::Path, visitor: &mut V, follow_symlink: bool)
+    where
+        V: Visitor,
+    {
+        if let Err(err) = throw_error(path, visitor, follow_symlink) {
+            visitor.on_error(path, err);
         }
     }
 
-    walk_path_inner(path.as_ref(), visitor, follow_symlink)
+    catch_error(path.as_ref(), visitor, follow_symlink);
 }
