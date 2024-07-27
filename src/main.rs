@@ -80,10 +80,12 @@ where
     V: Visitor,
 {
     // An helper that returns `Result` so `?` can be used internally.
+
     fn throw_error<V>(
         path: &path::Path,
         visitor: &mut V,
         follow_symlink: bool,
+        ignore_special_file: bool,
     ) -> anyhow::Result<()>
     where
         V: Visitor,
@@ -95,30 +97,38 @@ where
         };
 
         let ty = meta?.file_type();
-        if ty.is_file() {
+
+        // From now on we can ignore symlink.
+
+        if ty.is_file() || (!ty.is_dir() && !ignore_special_file) {
             return visitor.visit_file(&path);
         }
 
         if ty.is_dir() {
             for e in fs::read_dir(&path)? {
                 let e = e?;
-                catch_error(&e.path(), visitor, follow_symlink);
+                // Ignore special files not at the top level.
+                catch_error(&e.path(), visitor, follow_symlink, true);
             }
             return Ok(());
         }
 
-        // Ignore other file types like: block device, char device, etc.
         Ok(())
     }
 
-    fn catch_error<V>(path: &path::Path, visitor: &mut V, follow_symlink: bool)
-    where
+    fn catch_error<V>(
+        path: &path::Path,
+        visitor: &mut V,
+        follow_symlink: bool,
+        ignore_special_file: bool,
+    ) where
         V: Visitor,
     {
-        if let Err(err) = throw_error(path, visitor, follow_symlink) {
+        if let Err(err) = throw_error(path, visitor, follow_symlink, ignore_special_file) {
             visitor.on_error(path, err);
         }
     }
 
-    catch_error(path.as_ref(), visitor, follow_symlink);
+    // Don't ignore special files at the top level
+    catch_error(path.as_ref(), visitor, follow_symlink, false);
 }
