@@ -30,19 +30,19 @@ fn main() -> anyhow::Result<()> {
     };
 
     for path in cli.paths {
-        walk_path(&path, &mut searcher, false);
+        walk_path(&path, &mut searcher, &mut ErrorReporter, false);
     }
 
     Ok(())
 }
 
-struct Searcher<W: io::Write> {
+struct Searcher<W> {
     pattern: regex::Regex,
     writer: W,
 }
 
 impl<W: io::Write> Searcher<W> {
-    fn search<R: io::Read>(&mut self, reader: R) -> anyhow::Result<()> {
+    fn search_in_reader<R: io::Read>(&mut self, reader: R) -> anyhow::Result<()> {
         let reader = io::BufReader::new(reader);
 
         for line in reader.lines() {
@@ -58,37 +58,44 @@ impl<W: io::Write> Searcher<W> {
     }
 }
 
-impl<W: io::Write> Visitor for Searcher<W> {
-    fn visit_file<P: AsRef<path::Path>>(&mut self, path: P) -> anyhow::Result<()> {
+// FileSearch
+trait FileSearch {
+    fn search<P: AsRef<path::Path>>(&mut self, file: P) -> anyhow::Result<()>;
+}
+impl<W: io::Write> FileSearch for Searcher<W> {
+    fn search<P: AsRef<path::Path>>(&mut self, path: P) -> anyhow::Result<()> {
         let file = fs::File::open(&path)?;
-        self.search(&file)
-    }
-
-    fn on_error(&self, path: &path::Path, err: anyhow::Error) {
-        eprintln!("ygrep: {}: {}", path.display(), err);
+        self.search_in_reader(&file)
     }
 }
 
-trait Visitor {
-    fn visit_file<P: AsRef<path::Path>>(&mut self, path: P) -> anyhow::Result<()>;
-    fn on_error(&self, path: &path::Path, err: anyhow::Error);
+trait ErrorHandle {
+    fn handle(&mut self, err: anyhow::Error, path: &path::Path);
+}
+struct ErrorReporter;
+impl ErrorHandle for ErrorReporter {
+    fn handle(&mut self, err: anyhow::Error, path: &path::Path) {
+        eprintln!("ygrep: {}: {}", path.display(), err)
+    }
 }
 
-fn walk_path<P, V>(path: P, visitor: &mut V, follow_symlink: bool)
+fn walk_path<P, S, E>(path: P, searcher: &mut S, err_handler: &mut E, follow_symlink: bool)
 where
     P: AsRef<path::Path>,
-    V: Visitor,
+    S: FileSearch,
+    E: ErrorHandle,
 {
     // An helper that returns `Result` so `?` can be used internally.
-
-    fn throw_error<V>(
+    fn throw_error<V, E>(
         path: &path::Path,
-        visitor: &mut V,
+        searcher: &mut V,
+        err_handler: &mut E,
         follow_symlink: bool,
         ignore_special_file: bool,
     ) -> anyhow::Result<()>
     where
-        V: Visitor,
+        V: FileSearch,
+        E: ErrorHandle,
     {
         let meta = if follow_symlink {
             fs::metadata(path)
@@ -101,14 +108,14 @@ where
         // From now on we can ignore symlink.
 
         if ty.is_file() || (!ty.is_dir() && !ignore_special_file) {
-            return visitor.visit_file(&path);
+            return searcher.search(&path);
         }
 
         if ty.is_dir() {
             for e in fs::read_dir(&path)? {
                 let e = e?;
                 // Ignore special files not at the top level.
-                catch_error(&e.path(), visitor, follow_symlink, true);
+                catch_error(&e.path(), searcher, err_handler, follow_symlink, true);
             }
             return Ok(());
         }
@@ -116,19 +123,27 @@ where
         Ok(())
     }
 
-    fn catch_error<V>(
+    fn catch_error<V, E>(
         path: &path::Path,
-        visitor: &mut V,
+        searcher: &mut V,
+        err_handler: &mut E,
         follow_symlink: bool,
         ignore_special_file: bool,
     ) where
-        V: Visitor,
+        V: FileSearch,
+        E: ErrorHandle,
     {
-        if let Err(err) = throw_error(path, visitor, follow_symlink, ignore_special_file) {
-            visitor.on_error(path, err);
+        if let Err(err) = throw_error(
+            path,
+            searcher,
+            err_handler,
+            follow_symlink,
+            ignore_special_file,
+        ) {
+            err_handler.handle(err, path);
         }
     }
 
     // Don't ignore special files at the top level
-    catch_error(path.as_ref(), visitor, follow_symlink, false);
+    catch_error(path.as_ref(), searcher, err_handler, follow_symlink, false);
 }
