@@ -4,40 +4,9 @@ use std::{
     path,
 };
 
-use clap::Parser;
-
-#[derive(Parser)]
-struct Cli {
-    /// Pattern
-    pattern: String,
-
-    /// Paths
-    paths: Vec<String>,
-
-    /// Output with JSON format
-    #[arg(long)]
-    json: bool,
-}
-
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
-    let pattern = regex::bytes::Regex::new(&cli.pattern)?;
-    let mut searcher = Searcher {
-        pattern,
-        writer: io::stdout(),
-    };
-
-    for path in cli.paths {
-        walk_path(&path, &mut searcher, &mut ErrorReporter, false);
-    }
-
-    Ok(())
-}
-
-struct Searcher<W> {
-    pattern: regex::bytes::Regex,
-    writer: W,
+pub struct Searcher<W> {
+    pub pattern: regex::bytes::Regex,
+    pub writer: W,
 }
 
 impl<W: io::Write> Searcher<W> {
@@ -94,7 +63,7 @@ impl<W: io::Write> Searcher<W> {
 }
 
 // FileSearch
-trait FileSearch {
+pub trait FileSearch {
     fn search(&mut self, file: &path::Path) -> anyhow::Result<()>;
 }
 impl<W: io::Write> FileSearch for Searcher<W> {
@@ -104,17 +73,17 @@ impl<W: io::Write> FileSearch for Searcher<W> {
     }
 }
 
-trait ErrorHandle {
+pub trait ErrorHandle {
     fn handle(&mut self, err: anyhow::Error, path: &path::Path);
 }
-struct ErrorReporter;
+pub struct ErrorReporter;
 impl ErrorHandle for ErrorReporter {
     fn handle(&mut self, err: anyhow::Error, path: &path::Path) {
         eprintln!("ygrep: {}: {}", path.display(), err)
     }
 }
 
-fn walk_path<P, S, E>(path: P, searcher: &mut S, err_handler: &mut E, follow_symlink: bool)
+pub fn walk_path<P, S, E>(path: P, searcher: &mut S, err_handler: &mut E, follow_symlink: bool)
 where
     P: AsRef<path::Path>,
     S: FileSearch,
