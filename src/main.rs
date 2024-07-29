@@ -4,7 +4,6 @@ use std::{
     path,
 };
 
-use anyhow::Ok;
 use clap::Parser;
 
 #[derive(Parser)]
@@ -23,7 +22,7 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let pattern = regex::Regex::new(&cli.pattern)?;
+    let pattern = regex::bytes::Regex::new(&cli.pattern)?;
     let mut searcher = Searcher {
         pattern,
         writer: io::stdout(),
@@ -37,21 +36,57 @@ fn main() -> anyhow::Result<()> {
 }
 
 struct Searcher<W> {
-    pattern: regex::Regex,
+    pattern: regex::bytes::Regex,
     writer: W,
 }
 
 impl<W: io::Write> Searcher<W> {
-    fn search_in_reader<R: io::Read>(&mut self, reader: R) -> anyhow::Result<()> {
-        let reader = io::BufReader::new(reader);
+    fn search_in_reader<R: io::Read>(
+        &mut self,
+        reader: R,
+        path: &path::Path,
+    ) -> anyhow::Result<()> {
+        let mut reader = io::BufReader::new(reader);
+        let mut header_printed = false;
+        let mut line_num = 1;
 
-        for line in reader.lines() {
-            let line = line?;
-            if self.pattern.is_match(&line) {
-                self.writer.write_all(line.as_bytes())?;
-                self.writer.write(b"\n")?;
-                self.writer.flush()?;
+        let mut offset = 0;
+
+        let mut buf = Vec::new();
+        while let Ok(n) = reader.read_until(b'\n', &mut buf) {
+            if n == 0 {
+                break;
             }
+            if buf.ends_with(b"\n") {
+                buf.pop();
+                if buf.ends_with(b"\r") {
+                    buf.pop();
+                }
+            }
+
+            if self.pattern.is_match(&buf) {
+                if !header_printed {
+                    header_printed = true;
+                    write!(self.writer, "{}", path.display())?;
+                }
+
+                if let Some(pos) = buf.iter().position(|&b| b == b'\0') {
+                    write!(
+                        self.writer,
+                        "binary file matches (found \"\\0\" byte around offset {})\n",
+                        offset + pos
+                    )?;
+                    break;
+                };
+
+                write!(self.writer, "{}:", line_num)?;
+                self.writer.write_all(&buf)?;
+                self.writer.write(b"\n")?;
+            }
+
+            line_num += 1;
+            offset += n;
+            buf.clear()
         }
 
         Ok(())
@@ -60,12 +95,12 @@ impl<W: io::Write> Searcher<W> {
 
 // FileSearch
 trait FileSearch {
-    fn search<P: AsRef<path::Path>>(&mut self, file: P) -> anyhow::Result<()>;
+    fn search(&mut self, file: &path::Path) -> anyhow::Result<()>;
 }
 impl<W: io::Write> FileSearch for Searcher<W> {
-    fn search<P: AsRef<path::Path>>(&mut self, path: P) -> anyhow::Result<()> {
-        let file = fs::File::open(&path)?;
-        self.search_in_reader(&file)
+    fn search(&mut self, file: &path::Path) -> anyhow::Result<()> {
+        let f = fs::File::open(&file)?;
+        self.search_in_reader(&f, file.as_ref())
     }
 }
 
