@@ -1,2 +1,2 @@
 # ygrep
-Yet another grep implementation, for practice and fun.
+A simple grep implementation in Rust, only for practice and fun.
