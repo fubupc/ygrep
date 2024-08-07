@@ -4,7 +4,10 @@ use std::{
     path,
 };
 
-use crate::walk::{walk_path, Error as WalkError};
+use crate::{
+    walk::{walk_path, Error as WalkError},
+    BufReadExt, LineDelimiter,
+};
 
 pub fn search_path<W: io::Write, P: AsRef<path::Path>>(
     pattern: &regex::bytes::Regex,
@@ -42,54 +45,43 @@ pub fn search_file<W: io::Write, P: AsRef<path::Path>>(
     search_reader(pattern, r, file, writer)
 }
 
-// TODO: To refactor reading line logic to an iterator.
 pub fn search_reader<R: io::Read, W: io::Write, P: AsRef<path::Path>>(
     pattern: &regex::bytes::Regex,
     reader: R,
     path: P,
     writer: &mut W,
-) -> Result<(), io::Error> {
-    let mut reader = io::BufReader::new(reader);
+) -> io::Result<()> {
+    let reader = io::BufReader::new(reader);
     let mut header_printed = false;
-    let mut line_num = 1;
-
     let mut offset = 0;
 
-    let mut buf = Vec::new();
-    while let Ok(n) = reader.read_until(b'\n', &mut buf) {
-        if n == 0 {
+    for (line_num, line) in reader.lines_ext().enumerate() {
+        let (line, delim) = line?;
+
+        if let Some(LineDelimiter::NUL) = delim {
+            if !header_printed {
+                writeln!(writer, "{}", path.as_ref().display())?;
+            }
+            write!(
+                writer,
+                "binary file matches (found \"\\0\" byte around offset {})\n",
+                offset + line.len()
+            )?;
             break;
         }
-        if buf.ends_with(b"\n") {
-            buf.pop();
-            if buf.ends_with(b"\r") {
-                buf.pop();
-            }
-        }
 
-        if pattern.is_match(&buf) {
+        if pattern.is_match(&line) {
             if !header_printed {
                 header_printed = true;
                 writeln!(writer, "{}", path.as_ref().display())?;
             }
 
-            if let Some(pos) = buf.iter().position(|&b| b == b'\0') {
-                write!(
-                    writer,
-                    "binary file matches (found \"\\0\" byte around offset {})\n",
-                    offset + pos
-                )?;
-                break;
-            };
-
             write!(writer, "{}:", line_num)?;
-            writer.write_all(&buf)?;
+            writer.write_all(&line)?;
             writer.write(b"\n")?;
         }
 
-        line_num += 1;
-        offset += n;
-        buf.clear()
+        offset += line.len();
     }
 
     Ok(())
